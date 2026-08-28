@@ -32,6 +32,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -283,30 +284,10 @@ class KeychainModule(reactContext: ReactApplicationContext) :
 
   @ReactMethod
   fun getAllGenericPasswordServices(options: ReadableMap?, promise: Promise) {
-    try {
-      val services = doGetAllGenericPasswordServices()
+    launchStorageOperation(promise) {
+      val services = prefsStorage.serviceNames
       promise.resolve(Arguments.makeNativeArray<Any>(services.toTypedArray()))
-    } catch (e: KeyStoreAccessException) {
-      promise.reject(Errors.E_KEYSTORE_ACCESS_ERROR, e)
     }
-  }
-
-  @Throws(KeyStoreAccessException::class)
-  private fun doGetAllGenericPasswordServices(): Collection<String> {
-    val cipherNames = prefsStorage.usedCipherNames
-    val ciphers: MutableCollection<CipherStorage?> = ArrayList(cipherNames.size)
-    for (storageName in cipherNames) {
-      val cipherStorage = getCipherStorageByName(storageName!!)
-      ciphers.add(cipherStorage)
-    }
-    val result: MutableSet<String> = HashSet()
-    for (cipher in ciphers) {
-      val aliases = cipher!!.getAllKeys()
-      for (alias in aliases) {
-        result.add(alias)
-      }
-    }
-    return result
   }
 
   @ReactMethod
@@ -316,7 +297,7 @@ class KeychainModule(reactContext: ReactApplicationContext) :
   }
 
   private fun resetGenericPassword(alias: String, promise: Promise) {
-    try {
+    launchStorageOperation(promise) {
       // First we clean up the cipher storage (using the cipher storage that was used to store the
       // entry)
       val resultSet = prefsStorage.getEncryptedEntry(alias)
@@ -327,12 +308,6 @@ class KeychainModule(reactContext: ReactApplicationContext) :
       // And then we remove the entry in the shared preferences
       prefsStorage.removeEntry(alias)
       promise.resolve(true)
-    } catch (e: KeyStoreAccessException) {
-      Log.e(KEYCHAIN_MODULE, e.message!!)
-      promise.reject(Errors.E_KEYSTORE_ACCESS_ERROR, e)
-    } catch (fail: Throwable) {
-      Log.e(KEYCHAIN_MODULE, fail.message, fail)
-      promise.reject(Errors.E_UNKNOWN_ERROR, fail)
     }
   }
 
@@ -345,26 +320,33 @@ class KeychainModule(reactContext: ReactApplicationContext) :
   @ReactMethod
   fun hasInternetCredentialsForOptions(options: ReadableMap, promise: Promise) {
     val server = options.getString(Maps.SERVER)
-    val alias = getAliasOrDefault(server)
-    val resultSet = prefsStorage.getEncryptedEntry(alias)
-    if (resultSet == null) {
-      Log.e(KEYCHAIN_MODULE, "No entry found for service: $alias")
-      promise.resolve(false)
-      return
-    }
-    promise.resolve(true)
+    hasCredentials(getAliasOrDefault(server), promise)
   }
 
   @ReactMethod
   fun hasGenericPasswordForOptions(options: ReadableMap?, promise: Promise) {
-    val service = getServiceOrDefault(options)
-    val resultSet = prefsStorage.getEncryptedEntry(service)
-    if (resultSet == null) {
-      Log.e(KEYCHAIN_MODULE, "No entry found for service: $service")
-      promise.resolve(false)
-      return
+    hasCredentials(getServiceOrDefault(options), promise)
+  }
+
+  private fun hasCredentials(alias: String, promise: Promise) {
+    launchStorageOperation(promise) {
+      promise.resolve(prefsStorage.getEncryptedEntry(alias) != null)
     }
-    promise.resolve(true)
+  }
+
+  /** Reads and deletion must use the same storage lock as encryption and decryption. */
+  private fun launchStorageOperation(promise: Promise, operation: () -> Unit) {
+    coroutineScope.launch {
+      try {
+        mutex.withLock { operation() }
+      } catch (e: KeyStoreAccessException) {
+        promise.reject(Errors.E_KEYSTORE_ACCESS_ERROR, e)
+      } catch (e: CryptoFailedException) {
+        promise.reject(Errors.E_CRYPTO_FAILED, e)
+      } catch (fail: Throwable) {
+        promise.reject(Errors.E_UNKNOWN_ERROR, fail)
+      }
+    }
   }
 
   @ReactMethod
@@ -480,13 +462,15 @@ class KeychainModule(reactContext: ReactApplicationContext) :
     promptInfo: PromptInfo
   ): DecryptionResult {
     val handler = getInteractiveHandler(storage, promptInfo)
-    storage.decrypt(
-      handler,
-      alias,
-      resultSet.username!!,
-      resultSet.password!!,
-      SecurityLevel.ANY
-    )
+    runInterruptible {
+      storage.decrypt(
+        handler,
+        alias,
+        resultSet.username!!,
+        resultSet.password!!,
+        SecurityLevel.ANY
+      )
+    }
     CryptoFailedException.reThrowOnError(handler.error)
     if (null == handler.decryptionResult) {
       throw CryptoFailedException("No decryption results and no error. Something deeply wrong!")
@@ -505,7 +489,9 @@ class KeychainModule(reactContext: ReactApplicationContext) :
     promptInfo: PromptInfo
   ): CipherStorage.EncryptionResult {
     val handler = getInteractiveHandler(storage, promptInfo)
-    storage.encrypt(handler, alias, username, password, securityLevel)
+    runInterruptible {
+      storage.encrypt(handler, alias, username, password, securityLevel)
+    }
     CryptoFailedException.reThrowOnError(handler.error)
     if (null == handler.encryptionResult) {
       throw CryptoFailedException("No decryption results and no error. Something deeply wrong!")
